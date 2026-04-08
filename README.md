@@ -27,7 +27,7 @@
 
 ```bash
 # 克隆项目
-git clone <your-repo-url>
+git clone https://github.com/GlucoseHuang/DialogSystem.git
 cd DialogSystem
 
 # 安装依赖

@@ -1,0 +1,5 @@
+streamlit~=1.52.2
+openai~=2.14.0
+pandas~=2.3.3
+numpy~=2.4.0
+ltp~=4.2.14

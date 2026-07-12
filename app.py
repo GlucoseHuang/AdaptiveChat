@@ -382,7 +382,7 @@ with st.sidebar:
         st.info("暂无会话,点击上方按钮新建。")
 
 # --- 主界面 ---
-st.title("✨ 自适应对话")
+st.title("✨ 自适应对话系统")
 st.caption("每一轮回复前,系统会先告诉你它识别到的任务类型、感知到的状态、打算怎么答。")
 
 current_id = st.session_state.current_chat_id

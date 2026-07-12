@@ -2,6 +2,7 @@ streamlit~=1.52.2
 openai~=2.14.0
 ltp~=4.2.14
 baidu-aip~=4.16.0
+chardet
 
 # 兼容性锁版:LTP 4.2.14 仍在用 hf_hub_download(..., use_auth_token=...) 这个老 API,
 # 1.0 之后的 huggingface_hub 移除了该参数;transformers 5.x 又要求新版 huggingface_hub,

@@ -1,77 +1,49 @@
-# 消除Hugging Face tokenizers并行提示
+"""人智交互自适应支持系统 — 自由对话版。
+
+在原实验原型基础上改造:
+- 去掉实验任务选择、思维导图上传、组别/被试提示
+- 去掉本地日志落盘与邮件推送
+- 保留: 状态感知 → 策略选择 → 自适应回复 的核心三段式闭环
+- 保留: 多会话侧边栏、deepseek-reasoner 思维链流式输出
+- 新增: 每轮 LLM 自动识别任务类型(事实型 / 解释型 / 探索型),
+        选用对应的策略规则库
+- 新增: 每轮回复前渲染一张"自适应感知"卡片,顶部一行策略摘要,
+        内嵌 <details> 折叠区显示任务判断 + 5 维校准 + 分层推理
+        + 命中规则 + 策略向量
+
+先验知识 C2 简化处理:
+  - 第 1 轮视为"低"
+  - 第 2 轮及以后视为"高"
+这样无需思维导图输入也能让策略系统保持运转。
+"""
+
 import os
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# 设置国内镜像站
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-import sys
+# HF 镜像只在用户终端显式设置时才生效 (HF_ENDPOINT=...);不强制改默认值
+# (hf-mirror.com 镜像缺少 LTP/small 的 config.json,会导致 LTP 模型加载失败)
+
 import streamlit as st
 import uuid
 import time
-import json
-import smtplib
-import tempfile
-from datetime import datetime
-from email.mime.text import MIMEText
-from email.header import Header
-from email.utils import formataddr
 from openai import OpenAI
 from ltp import LTP
 from aip import AipNlp
 
-# 自编模块
-from chat import smart_chat_stream
-from state_aware import get_max_dependency_depth, get_sentiment_analysis, get_novelty, get_prior_knowledge
+from chat import smart_chat_stream, build_bubble_text, classify_task_type, TASK_LABEL
+from state_aware import get_max_dependency_depth, get_sentiment_analysis, get_novelty
 from strategy import ProactiveScaffoldingSystem
 from logger import logger
-from utils import process_single_image
 
 # ==============================================================================
-# 0. 基础配置与工具函数
+# 0. 配置与客户端
 # ==============================================================================
 
-# ── 启动时在终端选择实验信息（只读取一次，使用环境变量持久化）─────────────────
-_GROUP_ENV_KEY = "EXPERIMENT_GROUP"
-_PARTICIPANT_ENV_KEY = "PARTICIPANT_ID"
-if _GROUP_ENV_KEY not in os.environ:
-    print("\n" + "="*50)
-    print("  人智交互自适应支持系统 — 实验信息配置")
-    print("="*50)
-    # 选择组别
-    print("  [1] 实验组（启用自适应策略）")
-    print("  [2] 对照组（三维度固定为 0.5）")
-    print("-"*50)
-    while True:
-        choice = input("  请输入组别编号 (1 或 2): ").strip()
-        if choice in ("1", "2"):
-            break
-        print("  ❌ 输入无效，请重新输入 1 或 2")
-    os.environ[_GROUP_ENV_KEY] = "control" if choice == "2" else "experiment"
-    group_label = "对照组" if choice == "2" else "实验组"
-    # 输入被试编号
-    print("-"*50)
-    while True:
-        pid = input("  请输入被试编号 (如 P01): ").strip()
-        if pid:
-            break
-        print("  ❌ 被试编号不能为空，请重新输入")
-    os.environ[_PARTICIPANT_ENV_KEY] = pid
-    print(f"\n  ✅ 已选择【{group_label}】，被试编号【{pid}】，启动系统...\n")
+# 任务类型由 LLM 每轮自动识别(见 classify_task_type),此处不再硬编码
 
-EXPERIMENT_GROUP = os.environ[_GROUP_ENV_KEY]      # "experiment" 或 "control"
-IS_CONTROL_GROUP = (EXPERIMENT_GROUP == "control")
-PARTICIPANT_ID   = os.environ[_PARTICIPANT_ENV_KEY] # 被试编号，如 P01
-
-# ── 本地日志文件路径（与 app.py 同目录下的 experiment_logs/ 文件夹）─────────
-_LOG_ENV_KEY = "EXPERIMENT_LOG_FILE"
-if _LOG_ENV_KEY not in os.environ:
-    _log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "experiment_logs")
-    os.makedirs(_log_dir, exist_ok=True)
-    _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _log_filename = f"{PARTICIPANT_ID}_{EXPERIMENT_GROUP}_{_timestamp}.jsonl"
-    os.environ[_LOG_ENV_KEY] = os.path.join(_log_dir, _log_filename)
-    print(f"  📁 实验数据将保存至: {os.environ[_LOG_ENV_KEY]}\n")
-
-LOCAL_LOG_FILE = os.environ[_LOG_ENV_KEY]
+# C2 校准锚点:简化处理,首轮视为"低",后续视为"高";100 在校准后会落在"高"集合
+C2_RAW_LOW = 0.0
+C2_RAW_HIGH = 100.0
 
 if not hasattr(st, "secrets"):
     st.secrets = {}
@@ -81,429 +53,454 @@ try:
     baidu_app_id = st.secrets.get("APP_ID", "")
     baidu_api_key = st.secrets.get("API_KEY", "")
     baidu_secret_key = st.secrets.get("SECRET_KEY", "")
-    baidu_vl_api_key = st.secrets.get("BAIDU_VL_API_KEY", "")
-    EMAIL_SENDER = st.secrets.get("EMAIL_SENDER", "")
-    EMAIL_PASSWORD = st.secrets.get("EMAIL_PASSWORD", "")
-    EMAIL_RECEIVER = st.secrets.get("EMAIL_RECEIVER", "")
 except Exception:
-    (deepseek_api_key,baidu_app_id,baidu_api_key,baidu_secret_key,
-     baidu_vl_api_key,EMAIL_SENDER,EMAIL_PASSWORD,EMAIL_RECEIVER) = '', '', '', '', '', '', '', ''
+    deepseek_api_key = baidu_app_id = baidu_api_key = baidu_secret_key = ""
 
 try:
     client = OpenAI(api_key=deepseek_api_key, base_url="https://api.deepseek.com")
     baidu_client = AipNlp(baidu_app_id, baidu_api_key, baidu_secret_key)
-    vl_client = OpenAI(base_url='https://qianfan.baidubce.com/v2',api_key=baidu_vl_api_key)
 except Exception as e:
-    client, baidu_client, vl_client = None, None, None
+    logger.error(f"客户端初始化失败: {e}")
+    client, baidu_client = None, None
+
 
 @st.cache_resource
 def load_ltp_model():
-    logger.info("📦 开始加载 LTP 模型 (系统初始化)...")
-    logger.info("✅ LTP 模型加载完成！")
+    logger.info("开始加载 LTP 模型...")
     return LTP()
+
+
 ltp_model = load_ltp_model()
 
-def save_log_local(log_data: dict) -> bool:
-    """
-    将单条实验日志以 JSON Lines 格式追加写入本地文件。
-    每行一条记录，程序崩溃也不丢失已有数据。
-    """
-    try:
-        with open(LOCAL_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
-        logger.info(f"💾 日志已追加写入本地文件: {LOCAL_LOG_FILE}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ 本地日志写入失败: {e}")
-        return False
 
-
-def send_log_email(log_data):
-    # 检查配置是否存在
-    if not EMAIL_SENDER or not EMAIL_PASSWORD or EMAIL_SENDER == "NO":
-        logger.info("邮件配置缺失或已禁用（EMAIL_SENDER=NO），跳过发送。")
-        return False
-    
-    try:
-        # 1. 准备邮件内容
-        json_str = json.dumps(log_data, indent=4, ensure_ascii=False)
-        subject = f"【实验日志】{log_data.get('participant_id', 'Unknown')}-{log_data.get('task_number', 'Unknown')}(Session {log_data.get('session_id', 'Unknown')[:8]}...)"
-        
-        message = MIMEText(json_str, 'plain', 'utf-8')
-        message['From'] = formataddr(("AI实验系统", EMAIL_SENDER))
-        message['To'] = formataddr(("研究员", EMAIL_RECEIVER))
-        message['Subject'] = Header(subject, 'utf-8')
-
-        # 2. 连接 SMTP 服务器 (推荐使用 587 端口 + starttls)
-        smtp_server = "smtp.qq.com"
-        
-        server = smtplib.SMTP(smtp_server, 587)
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        
-        # 3. 登录并发送
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_SENDER, [EMAIL_RECEIVER], message.as_string())
-        server.quit()
-        
-        logger.info("📧 邮件发送成功！")
-        return True
-
-    except Exception as e:
-        logger.error(f"❌ 邮件发送失败！详细错误: {e}")
-        return False
-    
 # ==============================================================================
 # 1. 后端逻辑
 # ==============================================================================
 
-def get_response_meta(task_key, task_text, user_query, chat_messages, mind_map_text):
+def compute_user_state(user_query, prior_user_messages):
+    """实时计算 A1/A2/A3;返回 (a1, a2, a3, c1, c2)。
+
+    prior_user_messages 是当前轮之前所有的用户消息内容(已按时间顺序)。
     """
-    计算感知特征与交互策略，返回元数据 dict 和 mode_settings。
-    不再在此处调用大模型（大模型的流式调用移到前端渲染部分，以便实时显示）。
-    【注意：为了节省时间和避免程序错误，思维导图过于复杂时直接截断，因此先验知识评分只是定性判断方便决策，不可作为真正的评分数据。】
+    a1 = get_max_dependency_depth(user_query, ltp_model)
+    a2 = get_sentiment_analysis(user_query, baidu_client)
+
+    if prior_user_messages:
+        reference = " ".join(prior_user_messages[-3:])  # 取最近 3 条作为新颖性参照
+        try:
+            a3 = get_novelty(reference, user_query, baidu_client)
+        except Exception as e:
+            logger.warning(f"A3 新颖性计算失败,使用中性值 0.5: {e}")
+            a3 = 0.5
+    else:
+        a3 = 0.5  # 首轮无参照,赋予中性隶属度
+
+    c1 = len(prior_user_messages) + 1  # 当前轮也算在内
+    c2 = C2_RAW_LOW if c1 == 1 else C2_RAW_HIGH
+
+    logger.info(
+        f"特征计算: A1={a1}, A2={a2:.4f}, A3={a3:.4f}, C1={c1}, C2={c2}"
+    )
+    return a1, a2, a3, c1, c2
+
+
+def _membership_tag(v):
+    """把 [0,1] 隶属度映射为高/中/低 + 颜色档。"""
+    if v >= 0.67:
+        return "高", "#2f855a"
+    if v <= 0.33:
+        return "低", "#c53030"
+    return "中", "#b7791f"
+
+
+def _strategy_row(v):
+    """0/0.5/1 → (档位文字, 颜色)。"""
+    return {0: ("低", "#c53030"), 0.5: ("中", "#b7791f"), 1: ("高", "#2f855a")}.get(v, ("?", "#4a5568"))
+
+
+# 维度含义表(隶属度 → 自然语言标签)
+_STATE_DIM_LABELS = {
+    "A1": "提问复杂度",
+    "A2": "情感倾向",
+    "A3": "新颖性",
+    "C1": "对话轮次",
+    "C2": "先验知识",
+}
+
+
+def render_adaptive_bubble(bubble_text, strategy_meta, strategy, turn_index):
+    """渲染统一的自适应感知卡片:顶部一行策略摘要,内嵌可展开的决策详情。
+
+    整张卡只有一个 border / 一个阴影,信息层次为:
+    - 顶行:🧠 自适应感知 · {摘要} · 第 N 轮
+    - 折叠区:<details> 摘要下方,点击展开查看 4 段决策详情
+
+    气泡摘要与展开后的策略向量由**同一份 strategy_meta + strategy 推导**,
+    不会出现「气泡说短句、详情显示 syntax=1」的不一致情况。
     """
-    start_ts = datetime.now()
-    logger.info(f"📨 收到用户请求: {user_query[:30]}...")
+    calibrated = strategy_meta.get("calibrated_state", {}) or {}
+    matched_rules = strategy_meta.get("matched_rules", []) or []
+    matched_src = strategy_meta.get("matched_rule_source", "")
+    final_src = strategy_meta.get("final_strategy_source", matched_src)
+    risk = strategy_meta.get("is_risk_detected", False)
 
-    logger.info("⚙️ 正在计算感知特征 (A1, A2, A3, C1, C2)...")
-    try:
-        a1 = get_max_dependency_depth(user_query, ltp_model)
-        a2 = get_sentiment_analysis(user_query, baidu_client)
-        a3 = get_novelty(task_text, user_query, baidu_client)
-        c1 = len([m for m in chat_messages if m.get('role') == 'user'])
-        c2 = get_prior_knowledge(task_key, mind_map_text, client)
-        logger.info(f"📊 特征计算结果: A1={a1}, A2={a2:.4f}, A3={a3:.4f}, C1={c1}, C2={c2}")
-    except Exception as e:
-        logger.error(f"❌ 特征计算失败，使用默认安全值: {e}")
-        a1, a2, a3, c1, c2 = 0, 0, 0, 0, 0
+    # ---------- ① 5 维状态校准表 ----------
+    state_rows = []
+    for dim in ["A1", "A2", "A3", "C1", "C2"]:
+        v = calibrated.get(dim)
+        if v is None:
+            continue
+        tag, color = _membership_tag(v)
+        state_rows.append(
+            f"<tr><td style='padding:3px 10px 3px 0; color:#4a5568;'>"
+            f"{_STATE_DIM_LABELS[dim]} <span style='color:#a0aec0;'>({dim})</span></td>"
+            f"<td style='padding:3px 10px; font-family:monospace;'>{v:.3f}</td>"
+            f"<td style='padding:3px 0; color:{color}; font-weight:600;'>{tag}</td></tr>"
+        )
+    state_table = (
+        "<table style='border-collapse:collapse; font-size:0.9em;'>"
+        + "".join(state_rows) + "</table>"
+    )
 
-    engine = ProactiveScaffoldingSystem(task_key=task_key, control_group=IS_CONTROL_GROUP)
-    user_features = {'syntax': a1, 'sentiment': a2, 'novelty': a3, 'turn': c1, 'priorknowledge': c2}
-    mode_settings, strategy_meta = engine.decide_interaction_strategy(a1=a1, a2=a2, a3=a3, c1=c1, c2=c2)
+    # ---------- ② 分层推理路径 ----------
+    if matched_src == "R_full+":
+        path_html = (
+            "<div style='margin:3px 0;'>"
+            "<span style='color:#2f855a;'>①</span> 匹配 <b>R_full+</b> 高收益组态 → "
+            f"命中 {len(matched_rules)} 条</div>"
+        )
+    elif matched_src == "R_core+":
+        path_html = (
+            "<div style='margin:3px 0;'>"
+            "<span style='color:#b7791f;'>①</span> R_full+ 无匹配 → 匹配 <b>R_core+</b> 核心条件 → "
+            f"命中 {len(matched_rules)} 条</div>"
+        )
+    elif matched_src == "control_group":
+        path_html = (
+            "<div style='margin:3px 0; color:#718096;'>"
+            "<span style='color:#718096;'>①</span> 对照组模式:跳过策略选择,使用固定中值</div>"
+        )
+    else:
+        path_html = (
+            "<div style='margin:3px 0;'>"
+            "<span style='color:#c53030;'>①</span> R_full+ / R_core+ 均无匹配 → "
+            "使用 <b>S_default</b></div>"
+        )
 
-    packet_meta = {
-        "request_timestamp": start_ts.strftime('%Y-%m-%d %H:%M:%S.%f'),
-        "user_query": user_query,
-        "user_query_length": len(user_query),
-        "task_context": task_text,
-        "mindmap_char_count": len(mind_map_text) if mind_map_text else 0,
-        "user_features": user_features,
-        "calibrated_state": strategy_meta["calibrated_state"],
-        "interaction_settings": mode_settings,
-        "matched_rules": strategy_meta["matched_rules"],
-        "matched_rule_source": strategy_meta["matched_rule_source"],
-        "is_risk_detected": strategy_meta["is_risk_detected"],
-        "final_strategy_source": strategy_meta["final_strategy_source"],
-    }
-    return packet_meta, mode_settings
+    if matched_src in ("R_core+", "default"):
+        risk_html = (
+            "<span style='color:#2f855a;'>✓ 通过</span>"
+            if not risk else
+            "<span style='color:#c53030;'>⚠ 触发低收益风险规则,已切换至安全策略(汉明距离最小)</span>"
+        )
+        path_html += (
+            "<div style='margin:3px 0;'>"
+            "<span style='color:#4a5568;'>②</span> 风险检查 → " + risk_html + "</div>"
+        )
+        if risk and final_src == "safe_search":
+            path_html += (
+                "<div style='margin:3px 0;'>"
+                "<span style='color:#4a5568;'>③</span> 在 27 个候选策略中按汉明距离选择最近的安全策略</div>"
+            )
+
+    # ---------- ③ 命中组态规则 ----------
+    if matched_rules:
+        rule_blocks = []
+        for i, r in enumerate(matched_rules, 1):
+            c = r.get("C", {})
+            s = r.get("S", {})
+            gamma = r.get("consistency", 0)
+            cov = r.get("raw_coverage", 0)
+            c_html = " · ".join(
+                f"{k}={v}" for k, v in c.items() if v != 0.5
+            ) or "(无约束)"
+            s_html = " · ".join(f"{k}={v}" for k, v in s.items())
+            rule_blocks.append(
+                f"<div style='margin:5px 0; padding:5px 9px; background:#fff; "
+                f"border-left:2px solid #6b8cff; border-radius:3px;'>"
+                f"<div style='font-size:0.85em; color:#4a5568;'>"
+                f"<b>规则 #{i}</b> · γ={gamma:.3f} · raw_cov={cov:.3f}</div>"
+                f"<div style='font-size:0.78em; color:#718096; margin-top:1px;'>"
+                f"条件: {c_html}</div>"
+                f"<div style='font-size:0.78em; color:#718096;'>"
+                f"策略: {s_html}</div></div>"
+            )
+        rules_html = "".join(rule_blocks)
+    else:
+        rules_html = (
+            "<div style='color:#a0aec0; font-size:0.85em; font-style:italic;'>"
+            "本轮无组态规则命中(对照组 / 默认回退)。</div>"
+        )
+
+    # ---------- ④ 本轮执行策略向量 ----------
+    strat_rows = []
+    strat_labels = [
+        ("syntax", "句法复杂度", {0: "短句分点", 0.5: "通顺自然", 1: "正式专业"}),
+        ("concept", "新概念密度", {0: "不引新概念", 0.5: "适度补背景", 1: "多引新概念"}),
+        ("proactivity", "系统主动性", {0: "答完即停", 0.5: "视情况追问", 1: "主动追问"}),
+    ]
+    for key, name, meaning in strat_labels:
+        v = strategy.get(key)
+        tag, color = _strategy_row(v)
+        m = meaning.get(v, "—")
+        strat_rows.append(
+            f"<tr><td style='padding:3px 10px 3px 0;'>{name}</td>"
+            f"<td style='padding:3px 10px; font-family:monospace;'>{v}</td>"
+            f"<td style='padding:3px 10px; color:{color}; font-weight:600;'>{tag}</td>"
+            f"<td style='padding:3px 0; color:#718096;'>{m}</td></tr>"
+        )
+    strat_table = (
+        "<table style='border-collapse:collapse; font-size:0.9em;'>"
+        + "".join(strat_rows) + "</table>"
+    )
+
+    # ---------- ⑤ 任务类型判断 ----------
+    task_key_seen = strategy_meta.get("task_key")
+    task_reason_seen = strategy_meta.get("task_reason", "—")
+    task_fallback = strategy_meta.get("task_fallback", False)
+    task_label_seen = TASK_LABEL.get(task_key_seen, task_key_seen or "—")
+    fallback_badge = (
+        "<span style='color:#c53030; font-size:0.85em;'>⚠ LLM 判断失败,使用默认 task2</span>"
+        if task_fallback else
+        "<span style='color:#2f855a; font-size:0.85em;'>✓ LLM 正常判断</span>"
+    )
+    task_table = (
+        "<table style='border-collapse:collapse; font-size:0.9em;'>"
+        f"<tr><td style='padding:3px 10px 3px 0;'>任务类型</td>"
+        f"<td style='padding:3px 10px; font-weight:600; color:#6b8cff;'>{task_label_seen}</td>"
+        f"<td style='padding:3px 0; color:#718096; font-family:monospace;'>({task_key_seen or '—'})</td></tr>"
+        f"<tr><td style='padding:3px 10px 3px 0;'>判断依据</td>"
+        f"<td colspan='2' style='padding:3px 0; color:#4a5568;'>{task_reason_seen}</td></tr>"
+        f"<tr><td style='padding:3px 10px 3px 0;'>调用状态</td>"
+        f"<td colspan='2' style='padding:3px 0;'>{fallback_badge}</td></tr>"
+        "</table>"
+    )
+
+    # ---------- 单卡 HTML ----------
+    html = f"""
+<div style="
+    background: linear-gradient(90deg, #f5f7ff 0%, #f9fafe 100%);
+    border-left: 3px solid #6b8cff;
+    padding: 10px 14px;
+    border-radius: 8px;
+    margin: 4px 0 6px 0;
+    font-size: 0.85em;
+    color: #4a5568;
+    max-width: 92%;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+">
+  <div>
+    <span style="color:#6b8cff; font-weight:600;">🧠 自适应感知</span>
+    <span style="color:#cbd5e0; margin:0 6px;">·</span>
+    <span style="color:#2d3748;">{bubble_text}</span>
+    <span style="color:#a0aec0; font-size:0.9em; margin-left:8px;">第 {turn_index} 轮</span>
+  </div>
+  <details style="margin-top:6px;">
+    <summary style="
+        cursor: pointer;
+        color: #6b8cff;
+        font-size: 0.9em;
+        padding: 2px 0;
+    ">决策详情</summary>
+    <div style="
+        margin-top: 8px;
+        padding: 10px 0 2px 0;
+        border-top: 1px dashed #cbd5e0;
+        color: #2d3748;
+    ">
+      <div style="color:#6b8cff; font-weight:600; margin-bottom:4px; font-size:0.95em;">① 5 维状态校准</div>
+      {state_table}
+      <div style="color:#6b8cff; font-weight:600; margin:10px 0 4px; font-size:0.95em;">② 分层推理路径</div>
+      {path_html}
+      <div style="color:#6b8cff; font-weight:600; margin:10px 0 4px; font-size:0.95em;">③ 命中组态规则</div>
+      {rules_html}
+      <div style="color:#6b8cff; font-weight:600; margin:10px 0 4px; font-size:0.95em;">④ 本轮执行策略向量</div>
+      {strat_table}
+      <div style="color:#6b8cff; font-weight:600; margin:10px 0 4px; font-size:0.95em;">⑤ 任务类型判断</div>
+      {task_table}
+    </div>
+  </details>
+</div>
+"""
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # ==============================================================================
 # 2. 前端界面
 # ==============================================================================
 
-st.set_page_config(page_title="人智交互自适应支持系统", page_icon="🎓", layout="wide")
-
-TASKS = {
-    "task1": "你在听新闻的过程中，主持人提到了“低空经济”这个概念。请使用生成式人工智能进行搜索，了解“低空经济”这一新产业的定义、特征、分类、地位以及发展措施。请用思维导图的形式呈现最终的搜索结果。",
-    "task2": "你家里的老人需要购买一部智能手机，但对智能手机的类型、性能、主要功能、价位、是否适合老人使用等的信息都不了解。请使用生成式人工智能进行搜索，给出你所认为的适合老人使用的智能手机。请用思维导图的形式呈现最终的搜索结果。",
-    "task3": "想象一下，您最近出现了发热、恶心、呕吐、腹泻等症状，偶尔还会打鼾。你想知道什么疾病都会导致上述症状？请使用生成式人工智能进行搜索，请用思维导图的形式呈现最终的搜索结果。"
-}
-TASK_LABELS = {"任务一：低空经济": "task1", "任务二：智能手机": "task2", "任务三：判断病情": "task3"}
+st.set_page_config(page_title="自适应对话", page_icon="✨", layout="wide")
 
 # --- Session State 初始化 ---
 if "conversations" not in st.session_state:
-    st.session_state.conversations = {} 
+    st.session_state.conversations = {}
 if "current_chat_id" not in st.session_state:
     st.session_state.current_chat_id = None
-if "experiment_logs" not in st.session_state:
-    st.session_state.experiment_logs = []
-if "current_turn_mindmap" not in st.session_state:
-    st.session_state.current_turn_mindmap = None 
-if "current_turn_mindmap_input_type" not in st.session_state:
-    st.session_state.current_turn_mindmap_input_type = None
-    
+if "pending_rerun" not in st.session_state:
+    st.session_state.pending_rerun = False
+
 # --- 侧边栏 ---
 with st.sidebar:
-    st.title("🗂️ 历史会话")
-    
+    st.title("会话")
+
     if st.button("➕ 新建对话", use_container_width=True, type="primary"):
         new_id = str(uuid.uuid4())
-
         st.session_state.conversations[new_id] = {
-            "title": f"对话 {len(st.session_state.conversations)+1}", 
-            "messages": [], 
-            "task": None,
-            "last_modified": time.time()
+            "title": f"对话 {len(st.session_state.conversations) + 1}",
+            "messages": [],
+            "last_modified": time.time(),
         }
         st.session_state.current_chat_id = new_id
-        st.session_state.current_turn_mindmap = None
-        st.session_state.current_turn_mindmap_input_type = None
         st.rerun()
 
     st.divider()
-    
+
     chat_ids = sorted(
         st.session_state.conversations.keys(),
         key=lambda k: st.session_state.conversations[k].get("last_modified", 0),
-        reverse=True
+        reverse=True,
     )
-    
+
     if chat_ids:
         if st.session_state.current_chat_id not in chat_ids:
-             st.session_state.current_chat_id = chat_ids[0]
-        
-        display_options = {cid: data['title'] for cid, data in st.session_state.conversations.items()}
-        
+            st.session_state.current_chat_id = chat_ids[0]
+
+        display_options = {cid: data["title"] for cid, data in st.session_state.conversations.items()}
+
         selected_id = st.radio(
-            "切换会话：", 
-            options=chat_ids, 
-            format_func=lambda x: display_options[x], 
+            "切换会话:",
+            options=chat_ids,
+            format_func=lambda x: display_options[x],
             key="chat_sel",
-            index=chat_ids.index(st.session_state.current_chat_id)
+            index=chat_ids.index(st.session_state.current_chat_id),
         )
-        
+
         if selected_id != st.session_state.current_chat_id:
             st.session_state.current_chat_id = selected_id
-            st.session_state.current_turn_mindmap = None
-            st.session_state.current_turn_mindmap_input_type = None
             st.rerun()
     else:
-        st.info("暂无历史会话，请点击上方按钮新建。")
+        st.info("暂无会话,点击上方按钮新建。")
 
 # --- 主界面 ---
-st.title("🎓 人智交互自适应支持系统")
-st.caption("Powered by DeepSeek & Streamlit")
+st.title("✨ 自适应对话")
+st.caption("每一轮回复前,系统会先告诉你它识别到的任务类型、感知到的状态、打算怎么答。")
 
 current_id = st.session_state.current_chat_id
 
-if current_id and current_id in st.session_state.conversations:
-    current_chat = st.session_state.conversations[current_id]
-    
-    if current_chat.get("task") is None:
-        st.info("👋 欢迎！为了提供更精准的回答，请先选择您当前进行的任务场景。")
-        with st.container(border=True):
-            st.subheader("请选择当前任务：")
-            
-            selected_label = st.radio(
-                "任务列表",
-                options=list(TASK_LABELS.keys()),
-                index=0,
-                key=f"task_radio_{current_id}",
-                horizontal=True
-            )
-            
-            preview_task_key = TASK_LABELS[selected_label]
-            st.markdown(f"**📝 任务描述：**\n\n> {TASKS[preview_task_key]}")
-            
-            st.write("")
-            
-            if st.button("✅ 确认并开始对话", type="primary"):
-                current_chat["task"] = current_chat["task"] = TASK_LABELS[selected_label]
-                current_chat["last_modified"] = time.time()
-                st.rerun()
-    else:
-        task_key = current_chat["task"]
-        task_text = TASKS[task_key]
-        current_label = [k for k, v in TASK_LABELS.items() if v == task_key][0]
-        with st.expander(f"📌 当前任务：{current_label} (点击查看详情)", expanded=False):
-            st.info(task_text)
-
-        for msg in current_chat["messages"]:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-        need_mindmap = st.session_state.current_turn_mindmap is None
-
-        if need_mindmap:
-            with st.container(border=True):
-                    st.warning("🔒 提问锁定：为了更好地辅助您，请先更新您当前的知识状态（思维导图）。")
-                    
-                    dynamic_key_suffix = f"{current_id}_{len(current_chat['messages'])}"
-
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown("#### 方式一：上传截图")
-                        uploaded_file = st.file_uploader("上传思维导图图片", type=["png", "jpg", "jpeg"], key=f"mm_uploader_{dynamic_key_suffix}")
-                        
-                    with col2:
-                        st.markdown("#### 方式二：粘贴文本")
-                        text_input = st.text_area("直接粘贴Markdown格式的节点文本", height=150, key=f"mm_text_{dynamic_key_suffix}")
-                    
-                    if st.button("🚀 提交并开始提问", type="primary", use_container_width=True):
-                        if uploaded_file is not None:
-                            with st.spinner("正在识别思维导图结构..."):
-                                try:
-                                    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp_file:
-                                        tmp_file.write(uploaded_file.getvalue())
-                                        tmp_file_path = tmp_file.name
-                                    extracted_text = process_single_image(vl_client, tmp_file_path)
-                                    os.remove(tmp_file_path)
-                                    if extracted_text:
-                                        st.session_state.current_turn_mindmap = extracted_text
-                                        st.session_state.current_turn_mindmap_input_type = "image"
-                                        st.rerun()
-                                    else: st.error("识别失败，请重试。")
-                                except Exception as e: st.error(f"处理出错: {e}")
-                        elif text_input.strip():
-                            st.session_state.current_turn_mindmap = text_input
-                            st.session_state.current_turn_mindmap_input_type = "text"
-                            st.rerun()
-                        else:
-                            st.toast("请至少上传一张图片或输入一段文本", icon="⚠️")
-        else:
-            st.success(f"✅ 当前知识状态已更新 (字符数: {len(st.session_state.current_turn_mindmap)})")
-
-        prompt_placeholder = "思维导图已记录，请输入您的问题..." if not need_mindmap else "🚫 请先在上方提交思维导图以解锁提问"
-        
-        prompt = st.chat_input(prompt_placeholder)
-
-        if prompt:
-            if need_mindmap:
-                st.toast("🔒 请先提交思维导图！", icon="🚫")
-            else:
-                # 显示用户消息
-                with st.chat_message("user"):
-                    st.markdown(prompt)
-                current_chat["messages"].append({"role": "user", "content": prompt})
-                
-                # 先计算特征和策略（含 spinner 提示），再流式渲染模型输出
-                with st.spinner("正在分析您的请求，请稍候..."):
-                    current_mindmap = st.session_state.current_turn_mindmap
-                    packet_meta, mode_settings = get_response_meta(
-                        task_key, task_text, prompt, current_chat["messages"], current_mindmap
-                    )
-
-                full_reasoning = ""
-                full_content = ""
-                usage_info = {}
-
-                with st.chat_message("assistant"):
-                    # 推理过程：用可折叠的 st.status 展示
-                    with st.status("系统推理中...", expanded=True) as status_box:
-                        reasoning_placeholder = st.empty()
-
-                    # 正式回复：在 status 块外创建占位符，用于逐步追加文本
-                    content_placeholder = st.empty()
-
-                    for chunk in smart_chat_stream(current_chat["messages"], mode_settings, client):
-                        if chunk["type"] == "reasoning":
-                            full_reasoning += chunk["text"]
-                            # 在 status 块内实时更新推理内容
-                            reasoning_placeholder.markdown(
-                                f"> {full_reasoning.replace(chr(10), chr(10) + '> ')}"
-                            )
-                        elif chunk["type"] == "content":
-                            if not full_content:
-                                # 第一个 content chunk 到达时，折叠推理框
-                                status_box.update(label="✅ 推理完成", state="complete", expanded=False)
-                            full_content += chunk["text"]
-                            # ★ 核心修复：每收到一个 content chunk 就立即更新占位符，实现流式效果
-                            content_placeholder.markdown(full_content + "▌")  # 光标符增强流式感
-                        elif chunk["type"] == "done":
-                            usage_info = chunk.get("usage", {})
-
-                    # 流结束后去掉光标符，渲染最终完整内容
-                    content_placeholder.markdown(full_content)
-
-                # 整理完整 packet 并记录
-                end_ts = datetime.now()
-                start_ts = datetime.strptime(packet_meta['request_timestamp'], '%Y-%m-%d %H:%M:%S.%f')
-                latency_s = round((end_ts - start_ts).total_seconds(), 3)
-                logger.info(f"⏱️ 本次交互总耗时: {latency_s:.2f}s")
-
-                # 当前对话轮次（以 user 消息数计）
-                turn_index = len([m for m in current_chat["messages"] if m.get("role") == "user"])
-
-                # 注意：为了节省时间和避免程序错误，思维导图过于复杂时直接截断，因此先验知识评分只是定性判断方便决策，不可作为真正的评分数据。
-
-                packet = {
-                    # ── 会话标识 ──────────────────────────────────────
-                    "session_id": current_id,
-                    "participant_id": PARTICIPANT_ID,        # 被试编号，如 P01
-                    "experiment_group": EXPERIMENT_GROUP,   # "experiment"=实验组 / "control"=对照组
-                    "task_number": task_key,
-                    "turn_index": turn_index,
-                    "model_chat": "deepseek-reasoner",      # 主对话模型
-                    "model_scorer": "deepseek-chat",        # 先验知识评分模型 (C2)
-
-                    # ── 时间戳与性能 ──────────────────────────────────
-                    "request_timestamp": packet_meta["request_timestamp"],
-                    "response_timestamp": end_ts.strftime('%Y-%m-%d %H:%M:%S.%f'),
-                    "response_latency_s": latency_s,
-
-                    # ── 用户输入 ──────────────────────────────────────
-                    "user_query": packet_meta["user_query"],
-                    "user_query_length": packet_meta["user_query_length"],
-                    "mindmap_input_type": st.session_state.current_turn_mindmap_input_type,
-                    "mindmap_char_count": packet_meta["mindmap_char_count"],
-                    "mindmap_text": current_mindmap,
-
-                    # ── 状态感知特征（原始值 + 校准后隶属度）────────
-                    "user_features": packet_meta["user_features"],
-                    "calibrated_state": packet_meta["calibrated_state"],
-
-                    # ── 策略决策过程 ──────────────────────────────────
-                    "matched_rule_source": packet_meta["matched_rule_source"],
-                    "matched_rules": packet_meta["matched_rules"],
-                    "is_risk_detected": packet_meta["is_risk_detected"],
-                    "final_strategy_source": packet_meta["final_strategy_source"],
-                    "interaction_settings": packet_meta["interaction_settings"],
-
-                    # ── 模型输出 ──────────────────────────────────────
-                    "response_content": full_content,
-                    "response_content_length": len(full_content),
-                    "reasoning_content": full_reasoning,
-                    "reasoning_content_length": len(full_reasoning),
-
-                    # ── Token 消耗（来自 deepseek-reasoner）──────────
-                    "prompt_tokens": usage_info.get("prompt_tokens", None),
-                    "completion_tokens": usage_info.get("completion_tokens", None),
-                    "total_tokens": (
-                        usage_info["prompt_tokens"] + usage_info["completion_tokens"]
-                        if usage_info.get("prompt_tokens") is not None and usage_info.get("completion_tokens") is not None
-                        else None
-                    ),
-                }
-
-                current_chat["messages"].append({
-                    "role": "assistant",
-                    "content": full_content,
-                    "reasoning": full_reasoning
-                })
-
-                st.session_state.experiment_logs.append(packet)
-                current_chat["last_modified"] = time.time()
-
-                try:
-                    save_log_local(packet)
-                except Exception as e:
-                    logger.error(f"本地日志写入异常: {e}")
-
-                try:
-                    send_log_email(packet)
-                except Exception:
-                    pass
-
-                # 重置思维导图状态，强制下一轮重新提交
-                st.session_state.current_turn_mindmap = None
-                st.session_state.current_turn_mindmap_input_type = None
-
-                if len(current_chat["messages"]) == 2:
-                    current_chat["title"] = prompt[:10] + "..."
-
-                time.sleep(0.5)
-                st.rerun()
-
-else:
+if not current_id or current_id not in st.session_state.conversations:
     st.markdown(
         """
         <div style='text-align: center; margin-top: 50px;'>
-            <h3>👋 欢迎使用</h3>
-            <p>请点击左侧侧边栏的 <b>"➕ 新建对话"</b> 按钮开始交互。</p>
+            <h3>👋 你好</h3>
+            <p>请点击左侧侧边栏的 <b>"➕ 新建对话"</b> 开始。</p>
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
+    st.stop()
+
+current_chat = st.session_state.conversations[current_id]
+
+# --- 渲染历史消息(含之前轮次的自适应感知卡片) ---
+for msg in current_chat["messages"]:
+    if msg.get("strategy_meta") and msg.get("strategy") and msg.get("adaptive_bubble"):
+        render_adaptive_bubble(
+            bubble_text=msg["adaptive_bubble"],
+            strategy_meta=msg["strategy_meta"],
+            strategy=msg["strategy"],
+            turn_index=msg.get("turn_index", 1),
+        )
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# --- 用户输入 ---
+prompt = st.chat_input("输入你的问题,回车发送...")
+
+if prompt:
+    # 1. 展示用户消息
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    current_chat["messages"].append({"role": "user", "content": prompt})
+
+    # 2. 提取上下文(本轮之前的用户提问)用于任务识别
+    prior_user_messages = [
+        m["content"] for m in current_chat["messages"][:-1] if m.get("role") == "user"
+    ]
+    recent_context = prior_user_messages[-2:]
+
+    # 3. LLM 识别本轮任务类型(事实型 / 解释型 / 探索型)
+    with st.spinner("正在识别任务类型..."):
+        task_key, task_reason, used_fallback = classify_task_type(
+            user_query=prompt,
+            recent_context=recent_context,
+            client=client,
+        )
+
+    # 4. 计算用户状态 + 选择策略(用识别出来的 task_key 选对应规则库)
+    a1, a2, a3, c1, c2 = compute_user_state(prompt, prior_user_messages)
+
+    with st.spinner("正在分析提问状态..."):
+        engine = ProactiveScaffoldingSystem(task_key=task_key)
+        mode_settings, strategy_meta = engine.decide_interaction_strategy(
+            a1=a1, a2=a2, a3=a3, c1=c1, c2=c2
+        )
+    # 把任务识别结果挂到 strategy_meta 上,UI 渲染时统一从这里取
+    strategy_meta["task_key"] = task_key
+    strategy_meta["task_reason"] = task_reason
+    strategy_meta["task_fallback"] = used_fallback
+
+    # 3. 构造自适应感知卡片(确定性:从 strategy_meta + strategy 推导,
+    #    气泡摘要与展开后的详情面板**同源**,保证内容一致)
+    bubble_text = build_bubble_text(strategy_meta, mode_settings)
+    render_adaptive_bubble(
+        bubble_text=bubble_text,
+        strategy_meta=strategy_meta,
+        strategy=mode_settings,
+        turn_index=int(c1),
+    )
+
+    # 4. 流式生成主回复
+    full_reasoning = ""
+    full_content = ""
+    usage_info = {}
+
+    with st.chat_message("assistant"):
+        with st.status("系统推理中...", expanded=True) as status_box:
+            reasoning_placeholder = st.empty()
+
+        content_placeholder = st.empty()
+
+        for chunk in smart_chat_stream(current_chat["messages"], mode_settings, client):
+            if chunk["type"] == "reasoning":
+                full_reasoning += chunk["text"]
+                reasoning_placeholder.markdown(
+                    f"> {full_reasoning.replace(chr(10), chr(10) + '> ')}"
+                )
+            elif chunk["type"] == "content":
+                if not full_content:
+                    status_box.update(label="✅ 推理完成", state="complete", expanded=False)
+                full_content += chunk["text"]
+                content_placeholder.markdown(full_content + "▌")
+            elif chunk["type"] == "done":
+                usage_info = chunk.get("usage", {})
+
+        content_placeholder.markdown(full_content)
+
+    # 5. 写回消息历史(同时把气泡、策略元数据存入)
+    current_chat["messages"].append({
+        "role": "assistant",
+        "content": full_content,
+        "reasoning": full_reasoning,
+        "adaptive_bubble": bubble_text,
+        "strategy": mode_settings,
+        "strategy_meta": strategy_meta,
+        "turn_index": int(c1),
+    })
+    current_chat["last_modified"] = time.time()
+
+    # 6. 若这是该对话的第 1 轮助手回复,更新标题为提问前 10 字
+    user_msg_count = sum(1 for m in current_chat["messages"] if m.get("role") == "user")
+    if user_msg_count == 1:
+        current_chat["title"] = prompt[:10] + ("..." if len(prompt) > 10 else "")
+
+    st.rerun()

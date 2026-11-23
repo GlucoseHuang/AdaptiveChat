@@ -34,7 +34,7 @@ Two properties set it apart from prompt-tuning or black-box personalisation:
 <p align="center">
   <img src="docs/assets/adaptive-card.png" alt="The adaptive awareness card expanded, showing calibrated state, matched rule, strategy vector and task recognition" width="680">
   <br>
-  <sub><b>Figure 1.</b> The per-turn decision card, rendered by the app's own code from a real engine run (turn 3, explanatory task, R_full+ rule matched). The product UI is in Chinese; see the <a href="#reading-the-card">gloss</a> below.</sub>
+  <sub><b>Figure 1.</b> The per-turn decision card, rendered by the app's own code from a real engine run (turn 3, explanatory task, R_full+ rule matched). The app's UI is in Chinese; this figure is an English rendering of the same card (see <a href="#reading-the-card">Reading the card</a>).</sub>
 </p>
 
 ## Why this is not a prompt wrapper

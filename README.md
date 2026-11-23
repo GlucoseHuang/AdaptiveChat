@@ -1,207 +1,246 @@
-# 自适应对话 · Adaptive Chat
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="Adaptive Chat: read the user's state, choose the strategy, show the decision" width="100%">
+</p>
 
-> 一份 Harness 探索:在 LLM 外包一层可解释的策略骨架。
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-4f46e5.svg"></a>
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776ab.svg">
+  <img alt="Streamlit" src="https://img.shields.io/badge/built%20with-Streamlit-ff4b4b.svg">
+  <img alt="LLM: DeepSeek" src="https://img.shields.io/badge/LLM-DeepSeek-1e1b4b.svg">
+  <img alt="Language: Chinese" src="https://img.shields.io/badge/conversation%20language-Chinese-red.svg">
+</p>
+
+<p align="center">
+  <a href="#abstract">Abstract</a> ·
+  <a href="#method">Method</a> ·
+  <a href="#transparent-decisions">Transparent decisions</a> ·
+  <a href="#empirical-results">Results</a> ·
+  <a href="#getting-started">Getting started</a> ·
+  <a href="#limitations">Limitations</a> ·
+  <a href="#citation">Citation</a>
+</p>
 
 ---
 
-## 一句话说明
+## Abstract
 
-在 LLM 对话链路上,前置一个**状态感知 + 实证组态匹配 + 低收益风险检查**的三段式决策器,实时把抽象的策略参数翻译成 LLM 可执行的自然语言指令。每一步决策都暴露在 UI 上,用户可以"看见"系统在做什么。
+Large language models answer every user in the same register, regardless of whether the user is confused, curious or already expert. **Adaptive Chat** is a research harness that closes this gap. Before each reply, a lightweight decision layer (i) recognises the *task context* of the turn, (ii) measures the user's *state* along five dimensions, (iii) selects a *response strategy* by matching that state against rules mined from a controlled experiment with fuzzy-set Qualitative Comparative Analysis (fsQCA), and (iv) vetoes strategies that the same experiment showed to be low-yield for that state. The chosen strategy is compiled into plain-language instructions for the LLM.
 
----
+Two properties set it apart from prompt-tuning or black-box personalisation:
 
-## 和普通 ChatGPT wrapper 的差异
+- **Empirically grounded.** Strategies come from configurations observed in a 30-participant randomised study, where the adaptive group achieved a **58.8% higher knowledge gain** than a fixed-strategy control (*p* < .001) at no significant cost in latency or tokens.
+- **Fully inspectable.** The calibrated state, the rule that fired, the risk check and the final strategy are rendered in the chat UI on every turn. Nothing happens off-screen.
 
-| 维度 | 普通 LLM 前端 | Adaptive Chat |
+<p align="center">
+  <img src="docs/assets/adaptive-card.png" alt="The adaptive awareness card expanded, showing calibrated state, matched rule, strategy vector and task recognition" width="680">
+  <br>
+  <sub><b>Figure 1.</b> The per-turn decision card, rendered by the app's own code from a real engine run (turn 3, explanatory task, R_full+ rule matched). The product UI is in Chinese; see the <a href="#reading-the-card">gloss</a> below.</sub>
+</p>
+
+## Why this is not a prompt wrapper
+
+| | Typical LLM front-end | Adaptive Chat |
 |---|---|---|
-| 回答风格 | 系统提示里写死,所有轮次一样 | **每轮根据用户状态动态选择** |
-| 决策依据 | 不可见 | 5 维校准向量 + 组态规则 + 风险检查,**全部可展开** |
-| 策略来源 | 人为拍脑袋写几句 | 来自实证组态(对照实验 58.8% 知识增益) |
-| 失败保护 | 没有 | 内置低收益风险规则 + 汉明距离回退到安全策略 |
+| Response style | One fixed system prompt | Re-selected every turn from the user's state |
+| Source of the policy | Hand-written intuition | fsQCA configurations from a randomised experiment |
+| Treatment of context | Ignored | Three task contexts, each with its own calibration anchors, rules and default |
+| Known failure modes | Not modelled | Low-gain state–strategy pairs (R⁻) are explicitly vetoed |
+| Observability | Opaque | Every intermediate quantity is shown to the user |
+| Fallbacks | None | Layered: `R_full+` → `R_core+` → `S_default`, plus a safe-strategy search |
 
----
+## Method
 
-## 核心机制
+<p align="center">
+  <img src="docs/assets/pipeline.svg" alt="Five-stage per-turn pipeline: task recognition, state sensing, rule matching, risk check, prompt assembly" width="100%">
+  <br>
+  <sub><b>Figure 2.</b> The per-turn decision pipeline.</sub>
+</p>
 
-每一轮用户提问进来,系统跑下面这套流水线:
+### 1. Task recognition
 
-```
-用户提问
-   │
-   ▼
-┌──────────────────────────────────────────┐
-│ ① 任务情境识别(LLM 实时判断)               │
-│   输入:当前提问 + 最近 2 轮上下文           │
-│   输出:task1(事实型) / task2(解释型)        │
-│        / task3(探索型)                      │
-│   失败回退:task2(默认)                      │
-│   依据:简短中文(例:"询问具体数据")          │
-└──────────────────────────────────────────┘
-   │ task_key
-   ▼
-┌──────────────────────────────────────────┐
-│ ② 状态感知层(5 维模糊集校准)              │
-│   A1 句法复杂度  ← LTP 依存句法            │
-│   A2 情感倾向    ← 百度 NLP sentiment      │
-│   A3 提问新颖性  ← 百度 NLP SimNet          │
-│   C1 对话轮次                              │
-│   C2 先验知识  (首轮=低,后续=高)           │
-│   校准方法:log-odds 直接校准                │
-└──────────────────────────────────────────┘
-   │ Ũ = (c₁,...,c₅) ∈ [0,1]⁵
-   ▼
-┌──────────────────────────────────────────┐
-│ ③ 策略选择层(fsQCA 实证组态,分层推理)      │
-│   按 task_key 选用对应任务类型的规则库      │
-│   R_full+ 高收益组态匹配  ── 命中即用       │
-│        ↓ 未命中                            │
-│   R_core+ 核心条件泛化   ── 取 γ 最大者     │
-│        ↓ 未命中                            │
-│   S_default 默认策略(每类任务有各自默认)    │
-└──────────────────────────────────────────┘
-   │ S_initial
-   ▼
-┌──────────────────────────────────────────┐
-│ ④ 风险检查层                                │
-│   ∃ R⁻: Match(Cₖ,Ũ)=1 ∧ Sₖ = S_initial?   │
-│        ↓ 是                                │
-│   在 {0,0.5,1}³ 共 27 个候选策略中          │
-│   取与 S_initial 汉明距离最小的安全策略       │
-│        ↓ S_safe = ∅                         │
-│   回退至 S_default                          │
-└──────────────────────────────────────────┘
-   │ S★ = {syntax, concept, proactivity}
-   ▼
-┌──────────────────────────────────────────┐
-│ ⑤ 自适应交互层(提示工程)                   │
-│   从指令库检索 3×3=9 条自然语言指令         │
-│   动态拼接为系统提示,发给 deepseek-reasoner  │
-└──────────────────────────────────────────┘
-   │
-   ▼
-流式回答
-```
+A short `deepseek-chat` call (temperature 0.1, sees the current message and the last two user turns) assigns the turn to one of three task contexts. Each context has a characteristic failure mode, which is why each gets its own policy:
 
-**四个核心设计选择**:
+| Context | User intent | Characteristic failure mode |
+|---|---|---|
+| `task1` Factual | Look up a fact or number | Information insufficiency: the system under-supplies facts |
+| `task2` Explanatory | Understand a cause, mechanism or relation | Cognitive inertia: shallow question, shallow answer |
+| `task3` Exploratory | Open-ended judgement or decision support | Information overload: too much output hurts |
 
-1. **任务感知代替固定模板** — 三类任务(事实型 / 解释型 / 探索型)各自有不同的策略库,系统按当前提问的认知目标自动选用
-2. **组态视角替代净效应** — 不再假设"特征 X 总是好的",而是看 5 维状态的**组合**
-3. **分层推理代替单层匹配** — `R_full+ → R_core+ → S_default` 三级回退,既利用实证又避免样本外失效
-4. **风险检查代替单点最优** — 引入 R⁻ 低收益组态,显式把"已知会失败的状态-策略组合"列为禁区
+The classifier is re-run every turn, so topics can shift mid-conversation. On any failure it falls back to `task2`, and the UI says so.
 
----
+### 2. State sensing and fuzzy-set calibration
 
-## 决策透明化 UI
+Five signals describe the user at turn *t*:
 
-每轮回复前,系统渲染**一张**自适应感知卡片,**顶部一行是策略摘要,内嵌 details 折叠区显示完整决策细节**。整个卡片共用一个边框、一个背景,视觉上是同一个组件,逻辑上是同一个内容。
+| Symbol | Dimension | Measured by |
+|---|---|---|
+| A1 | Syntactic complexity | Maximum dependency-tree depth of the message ([LTP](https://github.com/HIT-SCIR/ltp)) |
+| A2 | Sentiment | Positive-class probability ([Baidu NLP](https://cloud.baidu.com/product/nlp) `sentimentClassify`) |
+| A3 | Novelty | 1 − SimNet similarity to the user's last three messages (neutral 0.5 on turn 1) |
+| C1 | Dialogue stage | Turn number |
+| C2 | Prior knowledge | Low on turn 1, high afterwards (see [Limitations](#limitations)) |
 
-### 顶部(默认可见)
+Each raw value $u_j$ is mapped to a fuzzy membership $c_j \in [0,1]$ with Ragin's direct log-odds calibration, using task-specific anchors for non-membership ($\theta_n$, 5%), the crossover point ($\theta_c$, 50%) and full membership ($\theta_f$, 95%):
 
-```
-🧠 自适应感知 · 短句分点 · 多引新概念 · 答完即停  ·  来源:高收益组态命中     第 3 轮
-```
+$$
+c_j = \frac{e^{\ln 19 \cdot r_j}}{1 + e^{\ln 19 \cdot r_j}},
+\qquad
+r_j =
+\begin{cases}
+\dfrac{u_j - \theta_c}{\theta_f - \theta_c} & u_j \ge \theta_c 
+\dfrac{u_j - \theta_c}{\theta_c - \theta_n} & u_j < \theta_c
+\end{cases}
+$$
 
-### 折叠区(点击「▶ 决策详情」展开)
+The result is the calibrated state vector $\tilde U_t = (c_1, \dots, c_5) \in [0,1]^5$.
 
-```
-① 5 维状态校准
-   提问复杂度 (A1)    0.832  高
-   情感倾向   (A2)    0.451  中
-   新颖性     (A3)    0.671  高
-   对话轮次   (C1)    0.000  低
-   先验知识   (C2)    0.918  高
+### 3. Strategy space and rule base
 
-② 分层推理路径
-   ① 匹配 R_full+ 高收益组态 → 命中 1 条
+A strategy is a point in $\mathcal{S} = \{0, 0.5, 1\}^3$ over three dimensions (low / medium / high):
 
-③ 命中组态规则
-   规则 #1 · γ=0.962 · raw_cov=0.158
-   条件: A1=1 · A2=1 · A3=1 · C1=0 · C2=1
-   策略: syntax=0.5 · concept=1 · proactivity=0
+| Dimension | 0 (low) | 0.5 (medium) | 1 (high) |
+|---|---|---|---|
+| **Syntax** | Short sentences, steps or bullets | Clear, natural prose | Formal, multi-clause argumentation |
+| **Concept density** | Only concepts already in play | A little background when needed | New concepts and perspectives, clearly linked |
+| **Proactivity** | Stop after answering | Follow up only if the answer is incomplete | End with a probing question or next step |
 
-④ 本轮执行策略向量
-   句法复杂度   0.5  中  通顺自然
-   新概念密度   1    高  多引新概念
-   系统主动性   0    低  答完即停
+The rule base, mined with fsQCA, contains three sets per task context. Each rule is $R_i = (C_i, S_i, \gamma_i)$: a configuration of conditions, the strategy it supports, and its consistency.
 
-⑤ 任务类型判断
-   任务类型   解释型   (task2)
-   判断依据   询问因果机制
-   调用状态   ✓ LLM 正常判断
-```
+| Set | Meaning | Rules (factual / explanatory / exploratory) |
+|---|---|---|
+| $R^{+}_{\text{full}}$ | Full configurations associated with high knowledge gain | 6 / 5 / 3 |
+| $R^{+}_{\text{core}}$ | Core conditions of those configurations (parsimonious solutions) | 3 / 3 / 1 |
+| $R^{-}$ | Configurations associated with low knowledge gain (risk rules) | 6 / 8 / 6 |
 
-**气泡摘要与折叠详情严格同源**——都从 `strategy_meta` 和 `strategy` 同一份数据推导,不会出现"气泡说短句、详情显示 syntax=1"的不一致情况。
+A rule matches when every specified condition agrees with the user's state. A condition value of 1 requires $c_j \ge 0.5$, 0 requires $c_j \le 0.5$, and unspecified conditions impose no constraint:
 
----
+$$
+\delta(c, u) = \mathbb{1}\big[\,|c - u| \le 0.5\,\big],
+\qquad
+\operatorname{Match}(C, \tilde U) = \prod_{j} \delta(c_j, \tilde u_j)
+$$
 
-## 验证结果
+### 4. Hierarchical selection and risk check
 
-30 人随机分组对照实验(n=30,15+15):
+1. Collect matching rules in $R^{+}_{\text{full}}$. If any exist, use the strategy of the one with the highest $\gamma$. This result is final.
+2. Otherwise, do the same over $R^{+}_{\text{core}}$.
+3. Otherwise, use the per-task default $S_{\text{default}}$.
+4. For results from steps 2 and 3, check $S_{\text{init}}$ against the risk rules. If some $R_k \in R^{-}$ matches the current state with $S_k = S_{\text{init}}$, build the safe set and move to its nearest member under Hamming distance:
 
-- **知识增益**:实验组(M=57.87)较对照组(M=36.44)提升 **58.8%** ,p<.001
-- **响应时间**:52.17s vs 52.41s(无显著差异)
-- **Token 消耗**:1487 vs 1433(无显著差异)
-- **组态命中**:66 轮交互中 R_full+ 命中 18.2%、R_core+ 命中 48.5%,合计 2/3 的轮次得到实证组态支撑
+$$
+S_{\text{safe}} = \{ S \in \mathcal{S} \mid \nexists R_k \in R^{-} : \operatorname{Match}(C_k, \tilde U) = 1 \wedge S_k = S \},
+\qquad
+S^{\star} = \arg\min_{S \in S_{\text{safe}}} d_H(S, S_{\text{init}})
+$$
 
-结论:方法**有效且轻量**,增益来自策略选择本身,而非输出量差异。
+If $S_{\text{safe}}$ is empty, the system falls back to $S_{\text{default}}$.
 
----
+### 5. Prompt assembly
 
-## 与原型的差异(自由对话化)
+Each of the three strategy values selects one instruction from a 3 × 3 library. The three instructions are concatenated into the system prompt for `deepseek-reasoner`, which is streamed along with its reasoning trace. The prompt also tells the model not to mention or hint at these rules, so replies read naturally.
 
-实验原型是为受控实验设计的,本项目做了以下简化:
+## Transparent decisions
 
-- **任务选择自动完成**:原型里用户在三个预置任务(低空经济/智能手机/判断病情)中三选一,本项目改为 LLM 每轮实时识别,支持对话内的话题切换
-- **去掉思维导图上传**:C2 简化为「首轮=低,后续=高」,由对话轮次直接决定
-- **去掉邮件推送 / 组别分配 / 实验日志**:全部移除,只留对话
-- **保留多会话侧边栏**:对齐 DeepSeek 网页的交互习惯
-- **保留 deepseek-reasoner 思维链流式输出**:推理过程可折叠
+Before each answer the app renders one card. The top line is a one-sentence summary; the collapsible body shows the full trail. The summary and the body are derived from the same `strategy_meta` and `strategy` objects, so they cannot contradict each other.
 
----
+### Reading the card
 
-## 环境要求
+| Section in Figure 1 | Meaning |
+|---|---|
+| 5-dimension state calibration | Calibrated memberships for A1 complexity, A2 sentiment, A3 novelty, C1 dialogue stage, C2 prior knowledge, with a high / mid / low tag |
+| Layered reasoning path | Which rule set produced the strategy (`R_full+`, `R_core+`, default) and whether the risk check passed or triggered a safe-strategy search |
+| Matched configuration rules | The rule(s) that fired, with consistency γ and raw coverage |
+| Strategy vector for this turn | Final (syntax, concept, proactivity) values and what they mean in words |
+| Task-type judgement | Recognised task context, a ≤ 12-character rationale, and whether the classifier succeeded or fell back |
 
-- Python 3.10+
-- macOS / Linux / Windows
+## Empirical results
 
-## 安装
+<p align="center">
+  <img src="docs/assets/results.svg" alt="Knowledge gain 36.44 vs 57.87 (+58.8%, p < .001); 66.7% of turns matched an empirical rule; no significant difference in time or tokens" width="100%">
+  <br>
+  <sub><b>Figure 3.</b> Randomised controlled experiment (<i>n</i> = 30; 15 adaptive, 15 control) of the research prototype that this repository generalises.</sub>
+</p>
+
+| Outcome | Control (fixed 0.5/0.5/0.5) | Adaptive | Result |
+|---|---|---|---|
+| Knowledge gain (mean) | 36.44 | **57.87** | **+58.8%**, *p* < .001 |
+| Response time | 52.41 s | 52.17 s | no significant difference |
+| Token usage | 1,433 | 1,487 | no significant difference |
+| Turns backed by an empirical rule | n/a | 66.7% of 66 interactions | `R_full+` 18.2%, `R_core+` 48.5% |
+
+The gain therefore comes from *which* strategy is chosen, not from longer outputs.
+
+## From prototype to open conversation
+
+The experiment used a controlled prototype. This repository removes the scaffolding that only made sense inside an experiment:
+
+| | Research prototype | This repository |
+|---|---|---|
+| Task context | Participant picks one of three preset tasks | Recognised automatically every turn; topics can change mid-chat |
+| Prior knowledge (C2) | Scored from an uploaded mind map | Turn 1 = low, later turns = high |
+| Group assignment, e-mail delivery, experiment logs | Present | Removed |
+| Multi-session sidebar, streamed reasoning trace | Present | Kept |
+
+## Getting started
+
+**Requirements:** Python 3.10+, a [DeepSeek API](https://platform.deepseek.com/) key, a [Baidu AI Cloud NLP](https://cloud.baidu.com/product/nlp) application (App ID, API Key, Secret Key), and internet access on first run (LTP downloads its weights from Hugging Face).
 
 ```bash
 git clone https://github.com/GlucoseHuang/AdaptiveChat.git
 cd AdaptiveChat
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 配置
-
-在项目根目录创建 `.streamlit/secrets.toml`:
+Create `.streamlit/secrets.toml`:
 
 ```toml
-# DeepSeek API(主对话)
-DEEPSEEK_API_KEY = "your_deepseek_api_key"
+DEEPSEEK_API_KEY = "your_deepseek_api_key"   # task recognition + replies
 
-# 百度智能云 NLP(情感倾向 + SimNet 新颖性)
-APP_ID     = "your_baidu_app_id"
+APP_ID     = "your_baidu_app_id"             # sentiment + novelty
 API_KEY    = "your_baidu_api_key"
 SECRET_KEY = "your_baidu_secret_key"
 ```
-
-## 运行
 
 ```bash
 streamlit run app.py
 ```
 
----
+## Repository layout
 
-## 项目结构
+| File | Role |
+|---|---|
+| [`app.py`](app.py) | Streamlit entry point, session handling, decision-card rendering |
+| [`strategy.py`](strategy.py) | Calibration anchors, rule base, matching, risk check (`ProactiveScaffoldingSystem`) |
+| [`chat.py`](chat.py) | Task classifier, instruction library, streamed reply generation |
+| [`state_aware.py`](state_aware.py) | A1 / A2 / A3 feature extraction |
+| [`logger.py`](logger.py) | Coloured terminal logging of every decision step |
 
+## Limitations
+
+- **Chinese only.** LTP and Baidu NLP are Chinese-language models and the prompts and UI are in Chinese. Other languages need new state-sensing components and re-calibration.
+- **Evidence base.** The rules and anchors come from a single 30-participant study over three task domains. Their transfer to arbitrary open-domain conversation has not been evaluated.
+- **Simplified C2.** Without the mind-map step, prior knowledge is a two-valued proxy, so rules conditioned on C2 are coarse.
+- **External services.** State sensing and generation depend on the Baidu NLP and DeepSeek APIs.
+- **Session-scoped.** Conversations live in Streamlit session state and are not persisted.
+
+## Citation
+
+If you build on this work, please cite the software:
+
+```bibtex
+@software{adaptivechat2026,
+  author = {GlucoseHuang},
+  title  = {Adaptive Chat: Explainable, Configuration-Based Strategy Selection for LLM Dialogue},
+  year   = {2026},
+  url    = {https://github.com/GlucoseHuang/AdaptiveChat}
+}
 ```
-.
-├── app.py              # Streamlit 入口 + 自适应感知卡片渲染
-├── strategy.py         # 分层推理(校准 + 匹配 + 风险检查)
-├── chat.py             # 主回复流式生成 + 气泡摘要构造
-├── state_aware.py      # A1 句法深度 / A2 情感 / A3 新颖性
-├── logger.py           # 终端彩色日志
-└── requirements.txt
-```
+
+## Acknowledgements
+
+[LTP](https://github.com/HIT-SCIR/ltp) (HIT-SCIR) for dependency parsing, Baidu AI Cloud NLP for sentiment and short-text similarity, [DeepSeek](https://www.deepseek.com/) for generation, and Ragin's fuzzy-set calibration and fsQCA methodology for the rule-mining framework.
+
+## License
+
+Released under the [MIT License](LICENSE).
